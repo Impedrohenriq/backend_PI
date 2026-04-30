@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv
+venv/
+env/
+
+# Credenciais sensíveis — NUNCA commitar
+firebase-service-account.json
+*.json.secret
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
