@@ -1,5 +1,23 @@
 # Coleta de novas lojas
 
+## Amostra de dados
+
+`../database_sample.sql` contem uma amostra pequena de produtos e URLs de
+imagens do banco local, sem usuarios, alertas, feedbacks ou credenciais.
+Execute `database_setup.sql` primeiro e depois importe a amostra com psql:
+
+```powershell
+psql -U postgres -d hunter_db -f backend/database_setup.sql
+psql -U postgres -d hunter_db -f backend/database_sample.sql
+```
+
+Os comandos acima sao executados na raiz do projeto. As imagens continuam
+hospedadas nas lojas; a amostra armazena os links, sem baixar arquivos.
+Para regenerar a amostra, execute `python exportar_amostra.py` nesta pasta.
+O exportador tenta o banco local e usa o dump local como alternativa.
+
+## Executar coleta
+
 Adaptadores iniciais: Amazon Brasil, Magazine Luiza, Pichau e Terabyte.
 Usam a dependencia Scrapling ja presente no projeto; nao copie o repositorio
 do framework para esta pasta.
