@@ -39,6 +39,23 @@ def normalizar_nome(value: Any) -> str:
     return normalizar_espacos(value)
 
 
+def inferir_categoria(nome: str) -> str | None:
+    """Classifica apenas titulos reconheciveis, sem confundir acessorios."""
+    texto = slugificar(nome).replace("-", " ")
+    regras = (
+        (r"^placa (?:de )?video\b", "Placa de video (VGA)"),
+        (r"^processador\b", "Processador"),
+        (r"^placa mae\b", "Placa-mae"),
+        (r"^memoria (?:ram\b|.*\bddr[345]\b)", "Memoria RAM"),
+        (r"^ssd\b", "SSD"), (r"^(?:hd|disco rigido)\b", "HD (Disco Rigido)"),
+        (r"^fonte\b", "Fonte"), (r"^(?:water cooler|cooler)\b", "Cooler"),
+        (r"^gabinete\b", "Gabinete"), (r"^monitor\b", "Monitor"),
+        (r"^teclado\b", "Teclado"), (r"^mouse\b", "Mouse"),
+        (r"^(?:pendrive|pen drive)\b", "Pendrive"),
+    )
+    return next((categoria for padrao, categoria in regras if re.search(padrao, texto)), None)
+
+
 def normalizar_imagem_url(value: Any, base_url: str) -> str | None:
     """Aceita fotos HTTP e descarta placeholders e imagens embutidas."""
     if not isinstance(value, str):
@@ -51,7 +68,7 @@ def normalizar_imagem_url(value: Any, base_url: str) -> str | None:
     if partes.scheme not in {"http", "https"} or not partes.netloc:
         return None
     caminho = partes.path.lower()
-    if any(sinal in caminho for sinal in ("placeholder", "no-image", "no_image", "sem-imagem", "transparent", "spacer")):
+    if caminho.endswith(".svg") or any(sinal in caminho for sinal in ("/icons/", "/icones/", "iconheart", "placeholder", "no-image", "no_image", "sem-imagem", "transparent", "spacer")):
         return None
     return url
 

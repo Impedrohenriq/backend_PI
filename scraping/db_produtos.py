@@ -15,6 +15,7 @@ import psycopg2
 import psycopg2.extras
 
 from configuracao import get_config
+from normalizacao import inferir_categoria
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,12 @@ def preparar_schema() -> bool:
                 f"ALTER TABLE {tabela} ADD COLUMN IF NOT EXISTS atualizado_em "
                 "TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"
             )
+            cursor.execute(f"SELECT id, nome FROM {tabela} WHERE categoria IS NULL")
+            categorias = [(categoria, id_) for id_, nome in cursor.fetchall()
+                          if (categoria := inferir_categoria(nome))]
+            if categorias:
+                psycopg2.extras.execute_batch(cursor,
+                    f"UPDATE {tabela} SET categoria=%s WHERE id=%s AND categoria IS NULL", categorias)
 
             cursor.execute(
                 "SELECT indexname FROM pg_indexes WHERE tablename = %s", (tabela,)

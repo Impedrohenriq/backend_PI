@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from buscar_produtoskabum import _criar_sessao_navegador, detectar_bloqueio, salvar_html_falha, _is_transient_error
 from configuracao import get_config
 from db_produtos import preparar_schema, salvar_produtos_lojas
-from normalizacao import normalizar_nome, normalizar_preco, normalizar_imagem_url, extrair_imagem_tag
+from normalizacao import normalizar_nome, normalizar_preco, normalizar_imagem_url, extrair_imagem_tag, inferir_categoria
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +27,17 @@ class Loja:
     dominio: str
     busca: str
     produto_pattern: str
+    seletor_links: str = "a[href]"
+    seletor_nome: str = "h1"
+    seletor_preco: str = '[itemprop="price"]'
+    seletor_imagem: str = '[itemprop="image"]'
 
 
 LOJAS = {
-    "amazon": Loja("Amazon", "www.amazon.com.br", "https://www.amazon.com.br/s?k={termo}&page={pagina}", r"/(?:dp|gp/product)/[A-Z0-9]{10}"),
-    "magalu": Loja("Magazine Luiza", "www.magazineluiza.com.br", "https://www.magazineluiza.com.br/busca/{termo}/?page={pagina}", r"/p/[^/]+"),
-    "pichau": Loja("Pichau", "www.pichau.com.br", "https://www.pichau.com.br/search?q={termo}&page={pagina}", r"^/[^/]+(?:-[^/]+)+/?$"),
-    "terabyte": Loja("Terabyte", "www.terabyteshop.com.br", "https://www.terabyteshop.com.br/busca?str={termo}&pagina={pagina}", r"/produto/\d+"),
+    "amazon": Loja("Amazon", "www.amazon.com.br", "https://www.amazon.com.br/s?k={termo}&page={pagina}", r"/(?:dp|gp/product)/[A-Z0-9]{10}", '[data-component-type="s-search-result"] a[href]'),
+    "magalu": Loja("Magazine Luiza", "www.magazineluiza.com.br", "https://www.magazineluiza.com.br/busca/{termo}/?page={pagina}", r"/p/[^/]+", 'a[href*="/p/"]', 'h1[data-testid="heading-product-title"], h1', '[itemprop="price"], [data-testid="price-value"]'),
+    "pichau": Loja("Pichau", "www.pichau.com.br", "https://www.pichau.com.br/search?q={termo}&page={pagina}", r"^/[^/]+(?:-[^/]+)+/?$", 'main a[href]', 'h1', '[itemprop="price"], meta[property="product:price:amount"]'),
+    "terabyte": Loja("Terabyte", "www.terabyteshop.com.br", "https://www.terabyteshop.com.br/busca?str={termo}&pagina={pagina}", r"/produto/\d+", 'a[href*="/produto/"]', "h1", '[itemprop="price"], #valVista', '[itemprop="image"], #imgPrincipal'),
 }
 
 # Mesmos nomes de categoria usados pela Kabum e pelo filtro da API.
@@ -49,7 +53,7 @@ TERMOS = (
 
 def link_produto(href: str, loja: Loja) -> str | None:
     partes = urlsplit(urljoin(f"https://{loja.dominio}", href))
-    if partes.scheme not in {"http", "https"} or partes.hostname != loja.dominio:
+    if partes.scheme not in {"http", "https"} or partes.hostname not in {loja.dominio, loja.dominio.removeprefix("www.")}:
         return None
     match = re.search(loja.produto_pattern, partes.path, re.I)
     if not match:
@@ -70,10 +74,8 @@ def carregar(session, url: str, identificador: str) -> BeautifulSoup | None:
                 html = html.decode("utf-8", errors="replace")
             soup = BeautifulSoup(html, "html.parser")
             # Examina texto visivel para nao confundir scripts de CAPTCHA com bloqueios.
-            for script in soup.select("script, style"):
-                if script.get("type") != "application/ld+json":
-                    script.decompose()
-            if resposta.status in (403, 429) or detectar_bloqueio(soup.get_text(" ", strip=True)):
+            texto_visivel = " ".join(soup.stripped_strings)
+            if resposta.status in (403, 429) or detectar_bloqueio(texto_visivel):
                 salvar_html_falha(str(html), identificador)
                 logger.warning("Bloqueio em %s; coleta desta busca interrompida", url)
                 return None
@@ -112,7 +114,7 @@ def produtos_estruturados(soup):
                 fila.append(principal)
 
 
-def extrair_produto(soup, link: str, loja: Loja, categoria: str) -> dict | None:
+def extrair_produto(soup, link: str, loja: Loja, categoria: str | None) -> dict | None:
     nome = preco = None
     imagens = []
     for produto in produtos_estruturados(soup):
@@ -142,6 +144,24 @@ def extrair_produto(soup, link: str, loja: Loja, categoria: str) -> dict | None:
                 imagens.append(foto)
         break
 
+    # Fallback de detalhe: somente titulo principal e preco explicitamente marcado.
+    if not nome:
+        titulo = soup.select_one(loja.seletor_nome)
+        if titulo:
+            nome = normalizar_nome(titulo.get_text(" ", strip=True))
+    if preco is None:
+        valor = soup.select_one(loja.seletor_preco)
+        moeda = soup.select_one('[itemprop="priceCurrency"]')
+        moeda = moeda.get("content") or moeda.get_text(strip=True) if moeda else "BRL"
+        if valor and moeda == "BRL":
+            preco = normalizar_preco(valor.get("content") or valor.get_text(" ", strip=True))
+    if not imagens:
+        foto = soup.select_one(loja.seletor_imagem)
+        if foto:
+            url = normalizar_imagem_url(foto.get("content"), link) or extrair_imagem_tag(foto, link)
+            if url:
+                imagens.append(url)
+
     if loja.nome == "Amazon":
         titulo = soup.select_one("#productTitle")
         if titulo:
@@ -152,6 +172,16 @@ def extrair_produto(soup, link: str, loja: Loja, categoria: str) -> dict | None:
         foto = soup.select_one("#landingImage, #imgBlkFront")
         if foto:
             principal = normalizar_imagem_url(foto.get("data-old-hires"), link) or extrair_imagem_tag(foto, link)
+            if not principal:
+                try:
+                    resolucoes = json.loads(foto.get("data-a-dynamic-image") or "{}")
+                    candidatas = [(dimensoes[0] * dimensoes[1], url) for url, dimensoes in resolucoes.items()
+                                  if isinstance(dimensoes, list) and len(dimensoes) == 2
+                                  and all(isinstance(d, (int, float)) for d in dimensoes)]
+                    if candidatas:
+                        principal = normalizar_imagem_url(max(candidatas)[1], link)
+                except (ValueError, TypeError, AttributeError):
+                    pass
             if principal:
                 imagens = [principal] + [imagem for imagem in imagens if imagem != principal]
 
@@ -163,7 +193,9 @@ def extrair_produto(soup, link: str, loja: Loja, categoria: str) -> dict | None:
         imagem = normalizar_imagem_url(foto.get("content"), link) if foto else None
         if imagem:
             imagens.append(imagem)
-    return dict(nome=nome, preco=preco, link=link, categoria=categoria,
+    # O termo pode retornar suportes, combos e acessorios de outra categoria.
+    categoria_produto = inferir_categoria(nome)
+    return dict(nome=nome, preco=preco, link=link, categoria=categoria_produto,
                 origem=loja.nome, imagem_url=imagens[0] if imagens else None,
                 imagens_urls=imagens[:12])
 
@@ -188,7 +220,7 @@ def index(lojas, termos, max_paginas: int, max_produtos: int) -> int:
                     soup = carregar(session, url, f"{chave}_busca_{termo}_{pagina}")
                     if soup is None:
                         break
-                    links = list(dict.fromkeys(link for a in soup.select("a[href]")
+                    links = list(dict.fromkeys(link for a in soup.select(loja.seletor_links)
                                                if (link := link_produto(a["href"], loja)) and link not in vistos))
                     if not links:
                         logger.warning("%s: nenhum link novo para %s pagina %s", loja.nome, termo, pagina)
@@ -205,6 +237,8 @@ def index(lojas, termos, max_paginas: int, max_produtos: int) -> int:
                             salvos, _ = salvar_produtos_lojas([item])
                             total += salvos
                             gravados += salvos
+                        else:
+                            salvar_html_falha(str(detalhe), f"{chave}_extracao_{len(vistos)}")
                         if gravados >= max_produtos:
                             break
                     else:

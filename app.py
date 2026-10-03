@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from pydantic import BaseModel, Field
 import asyncpg
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import timedelta
-from typing import Optional, List
+from typing import Optional, List, Literal
 try:
     from auth import get_password_hash, verify_password, create_access_token, get_current_user
 except ModuleNotFoundError:
@@ -296,6 +296,23 @@ async def deletar_alerta(alerta_id: int, user_email: str = Depends(get_current_u
     return {"message": "Alerta deletado com sucesso!"}
 
 # Produtos (busca combinada Kabum + Mercado Livre)
+@app.get("/filtros-produtos", tags=["Produtos"])
+async def filtros_produtos(conn=Depends(get_db)):
+    rows = await conn.fetch("""
+        SELECT DISTINCT origem, categoria FROM (
+            SELECT 'Kabum'::text AS origem, categoria FROM produtos_kabum
+            UNION ALL
+            SELECT 'Mercado Livre'::text AS origem, categoria FROM produtos_mercadolivre
+            UNION ALL
+            SELECT origem, categoria FROM produtos_lojas
+        ) AS produtos
+    """)
+    return {
+        "lojas": sorted({row["origem"] for row in rows if row["origem"]}),
+        "categorias": sorted({row["categoria"] for row in rows if row["categoria"]}),
+    }
+
+
 @app.get(
     "/buscar-produtos",
     tags=["Produtos"],
@@ -308,7 +325,13 @@ async def deletar_alerta(alerta_id: int, user_email: str = Depends(get_current_u
         "Aceita filtro opcional por **categoria** (ex.: 'Placa de video (VGA)')."
     ),
 )
-async def buscar_produtos(nome: str, categoria: Optional[str] = None, conn=Depends(get_db)):
+async def buscar_produtos(
+    nome: str, categoria: Optional[str] = None, loja: Optional[str] = None,
+    preco_min: Optional[float] = Query(None, ge=0, allow_inf_nan=False),
+    preco_max: Optional[float] = Query(None, ge=0, allow_inf_nan=False),
+    ordenar: Literal["relevancia", "menor_preco", "maior_preco", "nome"] = "relevancia",
+    conn=Depends(get_db),
+):
     try:
         # Busca tolerante a acento/maiusculas (busca_unaccent) e com todos os
         # termos digitados (AND por palavra), ranqueada por similaridade de
@@ -317,6 +340,14 @@ async def buscar_produtos(nome: str, categoria: Optional[str] = None, conn=Depen
         palavras = [p for p in nome.strip().split() if p]
         if not palavras:
             raise HTTPException(status_code=400, detail="Informe um termo de busca")
+        if preco_min is not None and preco_max is not None and preco_min > preco_max:
+            raise HTTPException(status_code=400, detail="O preço mínimo deve ser menor ou igual ao máximo")
+        ordens = {
+            "relevancia": "similarity(busca_unaccent(lower(nome)), busca_unaccent(lower($3))) DESC, preco ASC",
+            "menor_preco": "preco ASC, nome ASC",
+            "maior_preco": "preco DESC, nome ASC",
+            "nome": "nome ASC, preco ASC",
+        }
 
         query = """
             SELECT id, nome, preco, link, imagem_url, imagens_urls, origem
@@ -339,9 +370,13 @@ async def buscar_produtos(nome: str, categoria: Optional[str] = None, conn=Depen
                 SELECT '%' || busca_unaccent(lower(p)) || '%' FROM unnest($1::text[]) AS p
             )
             AND ($2::text IS NULL OR categoria = $2)
-            ORDER BY similarity(busca_unaccent(lower(nome)), busca_unaccent(lower($3))) DESC, preco ASC
+            AND ($4::text IS NULL OR origem = $4)
+            AND ($5::numeric IS NULL OR preco >= $5)
+            AND ($6::numeric IS NULL OR preco <= $6)
+            AND $3::text IS NOT NULL
         """
-        rows = await conn.fetch(query, palavras, categoria, nome)
+        query += " ORDER BY " + ordens[ordenar]
+        rows = await conn.fetch(query, palavras, categoria, nome, loja, preco_min, preco_max)
         
         import json
         produtos = []

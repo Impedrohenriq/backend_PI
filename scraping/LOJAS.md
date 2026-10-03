@@ -31,8 +31,9 @@ python buscar_produtoslojas.py --lojas amazon magalu pichau terabyte --termos "t
 ```
 
 Sem `--termos`, coleta as categorias de hardware existentes, teclado, mouse
-e pendrive. `--limite` vale por termo e loja. Termos personalizados recebem
-categoria nula para nao classificar incorretamente um produto.
+e pendrive. `--limite` vale por termo e loja. A categoria e inferida pelo
+titulo do produto, usando a mesma classificacao dos filtros; titulos nao
+reconhecidos ficam sem categoria.
 
 O coletor prepara `produtos_lojas` antes da coleta. Para atualizar um banco
 existente antes de iniciar a API, execute tambem `backend/database_setup.sql`.
@@ -42,7 +43,8 @@ As variaveis `SCRAPER_*` e `PG_*` existentes continuam sendo usadas.
 Cada detalhe valido e salvo imediatamente; links repetidos atualizam o registro.
 Precos ausentes, nao positivos ou sem moeda BRL nas ofertas sao descartados.
 As fotos vem do JSON-LD Product da pagina; Amazon tambem usa a foto principal
-da galeria. Open Graph e usado quando nao ha fotos estruturadas.
+da galeria. Ha fallback por microdados e seletores de detalhe das lojas.
+Open Graph e usado quando nao ha fotos estruturadas.
 URLs de rastreamento sao removidas antes da deduplicacao.
 
 Os adaptadores sao iniciais e ainda nao foram validados em coleta ao vivo.

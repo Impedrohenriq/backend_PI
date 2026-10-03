@@ -211,12 +211,14 @@ def _extrair_imagens(produto_json: dict) -> tuple[str | None, list[str]]:
     return imagem_principal, imagens[:12]
 
 
-def coletar_detalhe_produto(sessao_http: requests.Session, href: str, categoria: str) -> dict | None:
+def coletar_detalhe_produto(sessao_http: requests.Session, href: str, categoria: str, session=None) -> dict | None:
     link = urljoin(BASE_URL, href)
     config = _config()
     for tentativa in range(config.scraper_max_retries + 1):
         try:
             resposta = sessao_http.get(link, timeout=20)
+            if resposta.status_code in (403, 429) and session is not None:
+                break
             resposta.raise_for_status()
             break
         except Exception as exc:
@@ -227,12 +229,24 @@ def coletar_detalhe_produto(sessao_http: requests.Session, href: str, categoria:
     else:
         return None
 
-    if detectar_bloqueio(resposta.text):
+    html = resposta.text
+    if session is not None and (resposta.status_code in (403, 429) or detectar_bloqueio(html)):
+        try:
+            pagina = session.fetch(link, network_idle=False, wait=1000, timeout=config.scraper_timeout_ms)
+            if pagina.status >= 400:
+                logger.warning("Falha HTTP %s no navegador: %s", pagina.status, link)
+                return None
+            html = pagina.body.decode("utf-8", errors="replace") if isinstance(pagina.body, bytes) else pagina.body
+        except Exception:
+            logger.exception("Falha ao carregar detalhe no navegador: %s", link)
+            return None
+
+    if detectar_bloqueio(html):
         logger.warning("Bloqueio detectado na pagina de detalhe: %s", link)
-        salvar_html_falha(resposta.text, f"bloqueio_detalhe_{href}")
+        salvar_html_falha(html, f"bloqueio_detalhe_{href}")
         return None
 
-    produto_json = _extrair_produto_next_data(resposta.text)
+    produto_json = _extrair_produto_next_data(html)
     if not produto_json:
         logger.warning("Nao foi possivel extrair dados estruturados de %s", link)
         return None
@@ -267,7 +281,7 @@ def coletar_categoria(session, sessao_http: requests.Session, categoria_nome: st
 
     produtos: list[dict] = []
     for indice, href in enumerate(links):
-        item = coletar_detalhe_produto(sessao_http, href, categoria_nome)
+        item = coletar_detalhe_produto(sessao_http, href, categoria_nome, session=session)
         if item:
             produtos.append(item)
         if config.scraper_min_delay_seconds and indice < len(links) - 1:
