@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     global db_pool
     db_pool = await asyncpg.create_pool(
         user='postgres',
-        password='0608',
+        password='Pedro@0608',
         database='hunter_db',
         host='localhost',
         port=5432
@@ -303,46 +303,45 @@ async def deletar_alerta(alerta_id: int, user_email: str = Depends(get_current_u
     description=(
         "🔎 Rota **pública** — pode ser acessada por qualquer visitante, mesmo sem autenticação. "
         "Realiza uma busca combinada de produtos nas tabelas **produtos_kabum** e **produtos_mercadolivre**, "
-        "ordenando os resultados do menor para o maior preço."
+        "tolerante a acentuação e com todas as palavras do termo (ex.: 'placa video rtx'), "
+        "ranqueada por similaridade de texto e, por fim, preço crescente. "
+        "Aceita filtro opcional por **categoria** (ex.: 'Placa de video (VGA)')."
     ),
 )
-async def buscar_produtos(nome: str, conn=Depends(get_db)):
+async def buscar_produtos(nome: str, categoria: Optional[str] = None, conn=Depends(get_db)):
     try:
+        # Busca tolerante a acento/maiusculas (busca_unaccent) e com todos os
+        # termos digitados (AND por palavra), ranqueada por similaridade de
+        # trigrama antes do preco. Ex.: "placa video rtx" ou "SSD 1tb" batem
+        # mesmo com erros de acentuacao ou ordem diferente das palavras.
+        palavras = [p for p in nome.strip().split() if p]
+        if not palavras:
+            raise HTTPException(status_code=400, detail="Informe um termo de busca")
+
         query = """
-            SELECT
-                id,
-                nome,
-                preco,
-                link,
-                imagem_url,
-                imagens_urls,
-                origem
+            SELECT id, nome, preco, link, imagem_url, imagens_urls, origem
             FROM (
                 SELECT
-                    id,
-                    nome,
-                    preco,
-                    link,
-                    imagem_url,
-                    imagens_urls,
+                    id, nome, preco, link, imagem_url, imagens_urls, categoria,
                     'Kabum' AS origem
                 FROM produtos_kabum
-                WHERE nome ILIKE $1
                 UNION ALL
                 SELECT
-                    id,
-                    nome,
-                    preco,
-                    link,
-                    imagem_url,
-                    NULL as imagens_urls,
+                    id, nome, preco, link, imagem_url, NULL AS imagens_urls, categoria,
                     'Mercado Livre' AS origem
                 FROM produtos_mercadolivre
-                WHERE nome ILIKE $1
+                UNION ALL
+                SELECT
+                    id, nome, preco, link, imagem_url, imagens_urls, categoria, origem
+                FROM produtos_lojas
             ) AS resultados
-            ORDER BY preco ASC
+            WHERE busca_unaccent(lower(nome)) ILIKE ALL (
+                SELECT '%' || busca_unaccent(lower(p)) || '%' FROM unnest($1::text[]) AS p
+            )
+            AND ($2::text IS NULL OR categoria = $2)
+            ORDER BY similarity(busca_unaccent(lower(nome)), busca_unaccent(lower($3))) DESC, preco ASC
         """
-        rows = await conn.fetch(query, f"%{nome}%")
+        rows = await conn.fetch(query, palavras, categoria, nome)
         
         import json
         produtos = []

@@ -1,301 +1,351 @@
+"""Scraper de produtos da Kabum.
+
+Arquitetura em duas etapas, adaptada ao site atual (Next.js):
+
+1. Listagem: usa o Scrapling (sessao de navegador real) para abrir cada
+   pagina de categoria e coletar os links "/produto/<id>/<slug>" - unico
+   seletor estavel, ja que a Kabum usa classes CSS geradas (styled
+   components) que mudam a cada deploy.
+2. Detalhe: cada pagina de produto da Kabum e renderizada no servidor
+   (Next.js) e embute o objeto completo do produto em JSON dentro de
+   <script id="__NEXT_DATA__">. Isso e lido com uma requisicao HTTP comum
+   (sem navegador), o que e muito mais rapido e retorna nome, preco e a
+   galeria de imagens completa (4 resolucoes) de forma estruturada, em
+   vez de tentar adivinhar seletores de carrossel via BeautifulSoup.
+"""
+
+from __future__ import annotations
+
+import json
 import logging
-import math
 import random
 import re
 import time
-import unicodedata
-import json
+from pathlib import Path
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+import requests
 
-from models_kabum import Produto
+from configuracao import BACKEND_DIR, get_config
+from db_produtos import preparar_schema, salvar_produtos_kabum
+from normalizacao import normalizar_espacos, normalizar_nome, normalizar_preco, normalizar_imagem_url
 
-# Configuração do logger
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Configuração do banco de dados
-DATABASE_URL = "postgresql://postgres:0608@localhost:5432/hunter_db"
-engine = create_engine(DATABASE_URL)
-Session = sessionmaker(bind=engine)
+BASE_URL = "https://www.kabum.com.br"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+PAGE_SIZE = 20
 
-MAX_PAGES_PER_CATEGORY = 20
-CATEGORY_URLS = [
-    ("monitor", "https://www.kabum.com.br/hardware/monitores"),
-]
-MAX_PRODUTOS = MAX_PAGES_PER_CATEGORY * 20 * len(CATEGORY_URLS)
+# Categorias principais de hardware (nome de exibicao -> slug da URL),
+# confirmadas ao vivo em kabum.com.br/hardware/<slug>.
+CATEGORIAS_KABUM: tuple[tuple[str, str], ...] = (
+    ("Placa de video (VGA)", "placa-de-video-vga"),
+    ("Processador", "processadores"),
+    ("Placa-mae", "placas-mae"),
+    ("Memoria RAM", "memoria-ram"),
+    ("SSD", "ssd-2-5"),
+    ("HD (Disco Rigido)", "disco-rigido-hd"),
+    ("Fonte", "fontes"),
+    ("Cooler", "coolers"),
+    ("Gabinete", "gabinetes"),
+    ("Monitor", "monitores"),
+)
+
+_BLOQUEIO_SINAIS = (
+    "captcha",
+    "unusual traffic",
+    "atividade incomum",
+    "verify you are human",
+    "confirme que voce nao e um robo",
+    "access denied",
+)
 
 
-def normalize_text(text: str) -> str:
-    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+def _config():
+    return get_config()
 
 
-def parse_price(raw: str) -> float | None:
-    numeric = re.sub(r"[^0-9,]", "", raw.replace("R$", "").strip()).replace(",", ".")
+def detectar_bloqueio(texto: str) -> bool:
+    normalizado = normalizar_espacos(texto).lower()
+    return any(sinal in normalizado for sinal in _BLOQUEIO_SINAIS)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    texto = f"{type(exc).__name__}: {exc}".lower()
+    sinais = (
+        "timeout",
+        "timed out",
+        "net::err_",
+        "connection reset",
+        "connection refused",
+        "temporarily unavailable",
+        "target closed",
+    )
+    return any(sinal in texto for sinal in sinais)
+
+
+def salvar_html_falha(conteudo: str, identificador: str) -> Path | None:
+    if not _config().scraper_save_failure_html:
+        return None
+    destino = BACKEND_DIR / "scraping" / "dados" / "falhas"
+    destino.mkdir(parents=True, exist_ok=True)
+    seguro = re.sub(r"[^\w.-]+", "_", identificador)[:80]
+    caminho = destino / f"{seguro}.html"
+    caminho.write_text(conteudo, encoding="utf-8", errors="ignore")
+    return caminho
+
+
+def _criar_sessao_navegador():
+    from scrapling.fetchers import DynamicSession, StealthySession
+
+    config = _config()
+    classe = StealthySession if config.scraper_fetcher == "stealthy" else DynamicSession
+    return classe(headless=config.scraper_headless, timeout=config.scraper_timeout_ms)
+
+
+def _extrair_total_produtos(texto_pagina: str) -> int | None:
+    match = re.search(r"([\d.]+)\s*produtos?\b", texto_pagina, re.I)
+    if not match:
+        return None
     try:
-        return float(numeric)
+        return int(match.group(1).replace(".", ""))
     except ValueError:
         return None
 
 
-def build_driver() -> webdriver.Chrome:
-    options = ChromeOptions()
-    options.add_argument("--remote-allow-origins=*")
-    options.add_argument("--start-maximized")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+def _coletar_links_categoria(session, categoria_nome: str, slug: str, max_paginas: int) -> list[str]:
+    config = _config()
+    base_url = f"{BASE_URL}/hardware/{slug}"
+    links: list[str] = []
+    vistos: set[str] = set()
+    total_produtos: int | None = None
 
-    options.binary_location = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-
-    service = ChromeService(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=options)
-
-
-def coletar_imagens_produto(driver: webdriver.Chrome, link_produto: str) -> list[str]:
-    """
-    Acessa a página do produto e coleta TODAS as imagens do carrossel/galeria.
-    Retorna uma lista de URLs de imagens.
-    """
-    imagens = []
-    try:
-        driver.get(link_produto)
-        time.sleep(random.uniform(1.5, 2.5))
-        
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        
-        # Tenta encontrar as miniaturas do carrossel da Kabum
-        # Seletores comuns na Kabum para galeria de imagens
-        thumb_containers = soup.find_all("div", class_=re.compile("thumb|miniatura|carousel|gallery", re.I))
-        
-        for container in thumb_containers:
-            imgs = container.find_all("img")
-            for img in imgs:
-                src = img.get("data-src") or img.get("src") or img.get("data-original")
-                if src:
-                    if src.startswith("//"):
-                        src = f"https:{src}"
-                    elif src.startswith("/"):
-                        src = f"https://www.kabum.com.br{src}"
-                    # Filtra imagens muito pequenas ou placeholders
-                    if "placeholder" not in src.lower() and "loading" not in src.lower():
-                        if src not in imagens:
-                            imagens.append(src)
-        
-        # Se não encontrou nas miniaturas, tenta a imagem principal e outras
-        if len(imagens) < 2:
-            # Busca todas as imagens na área do produto
-            produto_area = soup.find("div", class_=re.compile("product|produto", re.I))
-            if produto_area:
-                all_imgs = produto_area.find_all("img")
-                for img in all_imgs:
-                    src = img.get("data-src") or img.get("src") or img.get("data-zoom") or img.get("data-large")
-                    if src:
-                        if src.startswith("//"):
-                            src = f"https:{src}"
-                        elif src.startswith("/"):
-                            src = f"https://www.kabum.com.br{src}"
-                        # Filtra por tamanho mínimo e placeholders
-                        if "placeholder" not in src.lower() and "loading" not in src.lower() and "icon" not in src.lower():
-                            if src not in imagens:
-                                imagens.append(src)
-        
-        # Tenta também pegar do JSON-LD se disponível
-        script_tags = soup.find_all("script", type="application/ld+json")
-        for script in script_tags:
+    for pagina in range(1, max_paginas + 1):
+        url = f"{base_url}?page_number={pagina}&page_size={PAGE_SIZE}"
+        pagina_carregada = None
+        for tentativa in range(config.scraper_max_retries + 1):
             try:
-                data = json.loads(script.string)
-                if isinstance(data, dict):
-                    # Pode ter uma imagem única ou array
-                    if "image" in data:
-                        img_data = data["image"]
-                        if isinstance(img_data, list):
-                            for img_url in img_data:
-                                if img_url and img_url not in imagens:
-                                    imagens.append(img_url)
-                        elif isinstance(img_data, str) and img_data not in imagens:
-                            imagens.append(img_data)
-            except:
-                pass
-        
-        logging.info(f"Coletadas {len(imagens)} imagens para o produto")
-        
-    except Exception as e:
-        logging.warning(f"Erro ao coletar imagens do produto {link_produto}: {e}")
-    
-    return imagens[:10]  # Limita a 10 imagens por produto
+                pagina_carregada = session.fetch(
+                    url,
+                    network_idle=False,
+                    wait_selector='a[href*="/produto/"]',
+                    wait_selector_state="attached",
+                    wait=1000,
+                    timeout=config.scraper_timeout_ms,
+                )
+                break
+            except Exception as exc:
+                if detectar_bloqueio(str(exc)) or not _is_transient_error(exc) or tentativa >= config.scraper_max_retries:
+                    logger.warning("Falha ao carregar %s: %s", url, exc)
+                    pagina_carregada = None
+                    break
+                logger.info("Retry %s/%s para %s", tentativa + 1, config.scraper_max_retries, url)
+                time.sleep(min(8, 0.75 * (2**tentativa)))
 
-
-def coletar_produtos(
-    max_produtos: int,
-    categorias: list[tuple[str, str]] = CATEGORY_URLS,
-) -> list[dict]:
-    coletados: list[dict] = []
-
-    for categoria_nome, base_url in categorias:
-        if len(coletados) >= max_produtos:
+        if pagina_carregada is None:
             break
 
-        driver = build_driver()
+        corpo = getattr(pagina_carregada, "text", "") or ""
+        corpo_texto = corpo() if callable(corpo) else corpo
+        if detectar_bloqueio(str(corpo_texto)):
+            logger.error("Bloqueio detectado na categoria %s (pagina %s); interrompendo.", categoria_nome, pagina)
+            salvar_html_falha(str(corpo_texto), f"bloqueio_{slug}_p{pagina}")
+            break
+
+        if total_produtos is None:
+            total_produtos = _extrair_total_produtos(str(corpo_texto))
+
+        hrefs = pagina_carregada.css('a[href*="/produto/"]::attr(href)')
+        novos = 0
+        for href in hrefs:
+            href = str(href)
+            if href not in vistos:
+                vistos.add(href)
+                links.append(href)
+                novos += 1
+
+        logger.info("%s pagina %s: %s links novos (total %s)", categoria_nome, pagina, novos, len(links))
+
+        if novos == 0:
+            break
+        if total_produtos is not None and len(links) >= total_produtos:
+            break
+
+    return links
+
+
+def _extrair_produto_next_data(html: str) -> dict | None:
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S
+    )
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return payload.get("props", {}).get("pageProps", {}).get("product")
+
+
+def _extrair_imagens(produto_json: dict) -> tuple[str | None, list[str]]:
+    imagens: list[str] = []
+    for media in produto_json.get("medias") or []:
+        if not isinstance(media, dict):
+            continue
+        if media.get("type") and media.get("type") != "image":
+            continue
+        resolucoes = media.get("images") or {}
+        if not isinstance(resolucoes, dict):
+            continue
+        url = next((foto for chave in ("gg", "g", "m", "p")
+                    if (foto := normalizar_imagem_url(resolucoes.get(chave), BASE_URL))), None)
+        if url and url not in imagens:
+            imagens.append(url)
+    thumbnail = normalizar_imagem_url(produto_json.get("thumbnail"), BASE_URL)
+    imagem_principal = imagens[0] if imagens else thumbnail
+    if not imagens and thumbnail:
+        imagens.append(thumbnail)
+    return imagem_principal, imagens[:12]
+
+
+def coletar_detalhe_produto(sessao_http: requests.Session, href: str, categoria: str) -> dict | None:
+    link = urljoin(BASE_URL, href)
+    config = _config()
+    for tentativa in range(config.scraper_max_retries + 1):
         try:
-            driver.get(base_url)
-            time.sleep(random.uniform(1.5, 2.5))
-            soup = BeautifulSoup(driver.page_source, "html.parser")
+            resposta = sessao_http.get(link, timeout=20)
+            resposta.raise_for_status()
+            break
+        except Exception as exc:
+            if not _is_transient_error(exc) or tentativa >= config.scraper_max_retries:
+                logger.warning("Falha ao obter detalhe de %s: %s", link, exc)
+                return None
+            time.sleep(min(6, 0.5 * (2**tentativa)))
+    else:
+        return None
 
-            contador_tag = soup.find("div", id="listingCount")
-            if not contador_tag:
-                logging.warning(
-                    "Não foi possível identificar o total de produtos na primeira página de %s.",
-                    categoria_nome,
+    if detectar_bloqueio(resposta.text):
+        logger.warning("Bloqueio detectado na pagina de detalhe: %s", link)
+        salvar_html_falha(resposta.text, f"bloqueio_detalhe_{href}")
+        return None
+
+    produto_json = _extrair_produto_next_data(resposta.text)
+    if not produto_json:
+        logger.warning("Nao foi possivel extrair dados estruturados de %s", link)
+        return None
+
+    nome = normalizar_nome(produto_json.get("title"))
+    if not nome:
+        return None
+
+    precos = produto_json.get("prices") or {}
+    preco = normalizar_preco(precos.get("priceWithDiscount")) or normalizar_preco(precos.get("price")) or normalizar_preco(produto_json.get("price"))
+    if preco is None:
+        return None
+
+    imagem_url, imagens_urls = _extrair_imagens(produto_json)
+
+    return {
+        "nome": nome,
+        "preco": preco,
+        "link": link,
+        "imagem_url": imagem_url,
+        "imagens_urls": imagens_urls,
+        "categoria": categoria,
+    }
+
+
+def coletar_categoria(session, sessao_http: requests.Session, categoria_nome: str, slug: str, max_paginas: int) -> list[dict]:
+    config = _config()
+    links = _coletar_links_categoria(session, categoria_nome, slug, max_paginas)
+    if not links:
+        logger.warning("Nenhum link de produto encontrado para %s", categoria_nome)
+        return []
+
+    produtos: list[dict] = []
+    for indice, href in enumerate(links):
+        item = coletar_detalhe_produto(sessao_http, href, categoria_nome)
+        if item:
+            produtos.append(item)
+        if config.scraper_min_delay_seconds and indice < len(links) - 1:
+            time.sleep(random.uniform(config.scraper_min_delay_seconds, config.scraper_max_delay_seconds))
+
+    logger.info("%s: %s/%s produtos com detalhes coletados", categoria_nome, len(produtos), len(links))
+    return produtos
+
+
+def coletar_produtos(categorias: tuple[tuple[str, str], ...] = CATEGORIAS_KABUM) -> list[dict]:
+    """Mantido para compatibilidade/testes: coleta tudo em memoria, sem salvar.
+
+    O fluxo principal (`index`) nao usa esta funcao — ele salva categoria a
+    categoria via `index`, para nao perder progresso em execucoes longas.
+    """
+    config = _config()
+    coletados: list[dict] = []
+    sessao_http = requests.Session()
+    sessao_http.headers.update({"User-Agent": USER_AGENT})
+
+    with _criar_sessao_navegador() as session:
+        for categoria_nome, slug in categorias:
+            logger.info("Iniciando categoria: %s", categoria_nome)
+            try:
+                produtos = coletar_categoria(
+                    session, sessao_http, categoria_nome, slug, config.scraper_max_paginas_por_categoria
                 )
-                total_paginas = MAX_PAGES_PER_CATEGORY
-            else:
-                total_produtos = int(re.search(r"\d+", contador_tag.text).group())
-                total_paginas = max(1, math.ceil(total_produtos / 20))
-                total_paginas = min(total_paginas, MAX_PAGES_PER_CATEGORY)
-
-            for pagina in range(1, total_paginas + 1):
-                if len(coletados) >= max_produtos:
-                    break
-
-                logging.info(
-                    "Capturando página %s de %s (%s)",
-                    pagina,
-                    total_paginas,
-                    categoria_nome,
-                )
-                url = (
-                    f"{base_url}?page_number={pagina}&page_size=20&"
-                    "facet_filters=&sort=most_searched"
-                )
-                driver.get(url)
-                time.sleep(random.uniform(1, 1.5))
-
-                try:
-                    WebDriverWait(driver, 12).until(
-                        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.productCard"))
-                    )
-                except TimeoutException:
-                    logging.warning("Timeout aguardando produtos na página %s (%s)", pagina, categoria_nome)
-                    continue
-
-                soup = BeautifulSoup(driver.page_source, "html.parser")
-                cards = soup.find_all("article", class_=re.compile("productCard"))
-
-                for card in cards:
-                    nome_tag = card.find("span", class_=re.compile("nameCard"))
-                    preco_tag = card.find("span", class_=re.compile("priceCard"))
-                    link_tag = card.find("a", href=True)
-                    img_tag = card.find("img")
-
-                    if not nome_tag or not preco_tag or not link_tag:
-                        continue
-
-                    nome = normalize_text(nome_tag.get_text(strip=True))
-                    preco = parse_price(preco_tag.get_text(strip=True))
-                    if preco is None:
-                        continue
-
-                    link_produto = urljoin("https://www.kabum.com.br", link_tag.get("href"))
-
-                    # Imagem principal do card
-                    imagem_url = None
-                    if img_tag:
-                        imagem_url = img_tag.get("data-src") or img_tag.get("src")
-                        if imagem_url and imagem_url.startswith("//"):
-                            imagem_url = f"https:{imagem_url}"
-                    if not imagem_url:
-                        # fallback: verificar se há script com imagem explicita
-                        script_tag = card.find("script", type="application/ld+json")
-                        if script_tag:
-                            try:
-                                data = json.loads(script_tag.string)
-                                imagem_url = data.get("image")
-                            except Exception:
-                                imagem_url = None
-
-                    # Coleta TODAS as imagens entrando na página do produto
-                    logging.info(f"Coletando imagens do produto: {nome[:50]}...")
-                    todas_imagens = coletar_imagens_produto(driver, link_produto)
-                    
-                    # Se não conseguiu coletar imagens da página, usa a do card
-                    if not todas_imagens and imagem_url:
-                        todas_imagens = [imagem_url]
-
-                    coletados.append(
-                        {
-                            "nome": nome,
-                            "preco": preco,
-                            "link": link_produto,
-                            "imagem_url": imagem_url or (todas_imagens[0] if todas_imagens else None),
-                            "imagens_urls": todas_imagens,
-                            "categoria": categoria_nome,
-                        }
-                    )
-
-                    if len(coletados) >= max_produtos:
-                        break
-        finally:
-            driver.quit()
+                coletados.extend(produtos)
+            except Exception:
+                logger.exception("Falha inesperada na categoria %s", categoria_nome)
 
     return coletados
 
 
-def salvar_produtos(produtos: list[dict]) -> None:
-    session = Session()
-    try:
-        for item in produtos:
-            existente = (
-                session.query(Produto)
-                .filter_by(nome=item["nome"], link=item["link"])
-                .first()
+def index(categorias: tuple[tuple[str, str], ...] = CATEGORIAS_KABUM) -> int:
+    """Roda o scraping salvando categoria a categoria.
+
+    Uma execucao completa (10 categorias, ate 20 paginas cada) pode levar
+    mais de uma hora; salvar ao final de cada categoria, em vez de so no
+    fim de tudo, evita perder o progresso inteiro se o processo cair no
+    meio do caminho.
+    """
+    if not preparar_schema():
+        logger.error("Nao foi possivel preparar o schema do banco; abortando.")
+        return 0
+
+    config = _config()
+    sessao_http = requests.Session()
+    sessao_http.headers.update({"User-Agent": USER_AGENT})
+
+    total_salvos = 0
+    with _criar_sessao_navegador() as session:
+        for categoria_nome, slug in categorias:
+            logger.info("Iniciando categoria: %s", categoria_nome)
+            try:
+                produtos = coletar_categoria(
+                    session, sessao_http, categoria_nome, slug, config.scraper_max_paginas_por_categoria
+                )
+            except Exception:
+                logger.exception("Falha inesperada na categoria %s; pulando.", categoria_nome)
+                continue
+
+            if not produtos:
+                logger.warning("Nenhum produto coletado para %s.", categoria_nome)
+                continue
+
+            salvos, ignorados = salvar_produtos_kabum(produtos)
+            total_salvos += salvos
+            logger.info(
+                "%s: %s produtos gravados/atualizados (%s ignorados). Total ate agora: %s",
+                categoria_nome, salvos, ignorados, total_salvos,
             )
 
-            # Converte lista de imagens para JSON
-            imagens_json = json.dumps(item.get("imagens_urls", [])) if item.get("imagens_urls") else None
-
-            if existente:
-                existente.preco = item["preco"]
-                if item["imagem_url"]:
-                    existente.imagem_url = item["imagem_url"]
-                if imagens_json:
-                    existente.imagens_urls = imagens_json
-            else:
-                session.add(
-                    Produto(
-                        nome=item["nome"],
-                        preco=item["preco"],
-                        link=item["link"],
-                        imagem_url=item["imagem_url"],
-                        imagens_urls=imagens_json,
-                    )
-                )
-
-        session.commit()
-    finally:
-        session.close()
-
-
-def index(max_produtos: int = MAX_PRODUTOS) -> None:
-    produtos = coletar_produtos(max_produtos)
-    if not produtos:
-        logging.warning("Nenhum produto foi coletado da Kabum.")
-        return
-
-    salvar_produtos(produtos)
-    logging.info("%s produtos da Kabum foram gravados no banco.", len(produtos))
+    if total_salvos == 0:
+        logger.warning("Nenhum produto foi coletado da Kabum.")
+    return total_salvos
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     index()

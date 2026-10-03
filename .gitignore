@@ -26,3 +26,18 @@ firebase-service-account.json
 
 # Logs
 *.log
+
+# Local secrets and configuration
+.env.*
+!.env.example
+!.env.*.example
+firebase-service-account*.json
+*-firebase-adminsdk-*.json
+*.pem
+*.key
+
+# Database exports and scraper diagnostics
+database_dump.sql
+*.dump
+*.backup
+scraping/dados/

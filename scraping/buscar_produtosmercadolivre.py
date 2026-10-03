@@ -3,6 +3,7 @@ from sqlalchemy.orm import sessionmaker
 from models_mercadolivre import ProdutoMercadoLivre
 import requests
 from bs4 import BeautifulSoup
+from normalizacao import extrair_imagem_tag
 import time
 
 # URL do banco de dados
@@ -81,21 +82,18 @@ def buscar_produtos(url: str):
         produto = a_tag.get_text(strip=True)
         link = a_tag.get("href", "").strip()
 
-        img_tag = (
-            li.select_one("img.ui-search-result-image__element")
-            or li.select_one("img.ui-search-result__image")
-            or li.find("img")
+        # Limita a selecao a fotos do produto ou ao link do proprio item.
+        imagens = li.select(
+            "img.ui-search-result-image__element, img.ui-search-result__image, "
+            "img.poly-component__picture"
         )
-
+        if not imagens:
+            imagens = a_tag.select("img")
         imagem_url = None
-        if img_tag:
-            imagem_url = (
-                img_tag.get("data-src")
-                or img_tag.get("src")
-                or img_tag.get("data-srcset")
-            )
-            if imagem_url and " " in imagem_url:
-                imagem_url = imagem_url.split(" ")[0]
+        for img_tag in imagens:
+            imagem_url = extrair_imagem_tag(img_tag, resp.url)
+            if imagem_url:
+                break
 
         # ------------ PREÇO ------------
         # tenta capturar parte fracionária do preço (ex: 1.234)
